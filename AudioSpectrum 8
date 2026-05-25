@@ -1,0 +1,306 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// I2C LCD1602 configuration
+#define LCD_ADDRESS 0x27
+#define LCD_COLUMNS 16
+#define LCD_ROWS    2
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
+
+// Pin definitions for ESP32-C3
+#define SOUND_SENSOR_PIN 2    // Analog input for sound sensor (GPIO0)
+#define I2C_SDA_PIN 7         // SDA pin for LCD
+#define I2C_SCL_PIN 6         // SCL pin for LCD
+
+// Audio processing variables
+const int samplesToTake = 200;      // Number of samples per reading
+int audioBuffer[200];               // Buffer to store audio samples
+float frequencyBands[8] = {0};      // Energy in 8 frequency bands
+float barHeights[8] = {0};          // Current height of each bar (0-7)
+float smoothedBars[8] = {0};        // Smoothed bar heights for visual effect
+
+// Peak detection and decay
+float peakValues[8] = {100, 100, 100, 100, 100, 100, 100, 100};
+const float decayRate = 0.95;       // How fast peaks decay
+const float attackRate = 0.7;       // How fast bars rise
+const float releaseRate = 0.2;      // How fast bars fall
+
+// Timing variables
+unsigned long lastSampleTime = 0;
+const int sampleInterval = 20;       // Sample every 20ms (50Hz refresh)
+unsigned long lastDisplayUpdate = 0;
+const int displayUpdateInterval = 30; // Update display every 30ms
+
+// Simple FFT-like frequency detection using zero-crossing and amplitude variation
+float currentFrequency = 0;
+float smoothedFrequency = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  
+  // Initialize I2C with custom pins
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  delay(100);
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  
+  // Create custom characters for bars
+  createBarCharacters();
+  
+  // Display startup message
+  lcd.setCursor(0, 0);
+  lcd.print("Real-Time Audio");
+  lcd.setCursor(0, 1);
+  lcd.print("Visualizer");
+  delay(2000);
+  lcd.clear();
+  
+  // Configure ADC
+  analogReadResolution(12);  // 12-bit ADC (0-4095)
+  
+  Serial.println("Ready! Sound will control the bars in real-time");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  // Sample audio and update frequency bands
+  if (currentMillis - lastSampleTime >= sampleInterval) {
+    lastSampleTime = currentMillis;
+    processAudioSample();
+  }
+  
+  // Update LCD display
+  if (currentMillis - lastDisplayUpdate >= displayUpdateInterval) {
+    lastDisplayUpdate = currentMillis;
+    displayBars();
+  }
+  
+  delay(5); // Small delay to prevent overwhelming
+}
+
+void createBarCharacters() {
+  // Create 8 vertical bar characters (0-7 filled levels)
+  byte level0[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  byte level1[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF};
+  byte level2[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF};
+  byte level3[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF};
+  byte level4[8] = {0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};
+  byte level5[8] = {0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  byte level6[8] = {0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  byte level7[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  byte level8[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  
+  lcd.createChar(0, level0);
+  lcd.createChar(1, level1);
+  lcd.createChar(2, level2);
+  lcd.createChar(3, level3);
+  lcd.createChar(4, level4);
+  lcd.createChar(5, level5);
+  lcd.createChar(6, level6);
+  lcd.createChar(7, level7);
+}
+
+void processAudioSample() {
+  // Take multiple samples to detect amplitude and frequency
+  int sampleCount = 100;
+  long sum = 0;
+  int maxValue = 0;
+  int minValue = 4095;
+  int zeroCrossings = 0;
+  int lastValue = 0;
+  bool lastAboveZero = false;
+  
+  // Calculate DC offset (average value)
+  for (int i = 0; i < sampleCount; i++) {
+    int value = analogRead(SOUND_SENSOR_PIN);
+    sum += value;
+    if (value > maxValue) maxValue = value;
+    if (value < minValue) minValue = value;
+    delayMicroseconds(100); // Small delay between samples
+  }
+  
+  int dcOffset = sum / sampleCount;
+  int amplitude = maxValue - minValue;
+  
+  // Take another set of samples to detect zero crossings (for frequency)
+  int crossingCount = 0;
+  bool positive = false;
+  
+  for (int i = 0; i < 50; i++) {
+    int value = analogRead(SOUND_SENSOR_PIN) - dcOffset;
+    
+    if (i > 0) {
+      bool isPositive = (value > 20); // Threshold to avoid noise
+      if (isPositive != positive) {
+        crossingCount++;
+        positive = isPositive;
+      }
+    }
+    delayMicroseconds(200);
+  }
+  
+  // Calculate approximate frequency
+  // crossingCount/2 = number of cycles, over 50 samples * delay time
+  float sampleTimeSeconds = (50 * 200) / 1000000.0; // ~0.01 seconds
+  currentFrequency = (crossingCount / 2.0) / sampleTimeSeconds;
+  
+  // Smooth frequency reading
+  smoothedFrequency = smoothedFrequency * 0.7 + currentFrequency * 0.3;
+  
+  // Map frequency and amplitude to 8 bars
+  // Bar 0-1: Low frequencies (bass) - 20-200Hz
+  // Bar 2-3: Low-mid frequencies - 200-800Hz  
+  // Bar 4-5: Mid-high frequencies - 800-3000Hz
+  // Bar 6-7: High frequencies - 3000-10000Hz
+  
+  float normalizedAmplitude = constrain((float)amplitude / 1500.0, 0, 1);
+  
+  // Make bars respond differently based on frequency
+  for (int i = 0; i < 8; i++) {
+    float barResponse = 0;
+    
+    // Each bar has a preferred frequency range
+    float targetFreq = 50 * pow(2, i); // Exponential frequency spread: 50, 100, 200, 400, 800, 1600, 3200, 6400 Hz
+    
+    // Calculate how close the current frequency is to this bar's target
+    float frequencyMatch = 1.0 / (1.0 + abs(log(smoothedFrequency / targetFreq)) * 2);
+    
+    // Combine amplitude with frequency matching
+    float rawBarValue = normalizedAmplitude * (0.3 + frequencyMatch * 0.7);
+    
+    // Add some randomness and variety between bars
+    rawBarValue = rawBarValue * (0.7 + (i % 3) * 0.15);
+    
+    // Apply envelope (attack/release) for smoother movement
+    if (rawBarValue > smoothedBars[i]) {
+      // Attack - rise quickly
+      smoothedBars[i] = smoothedBars[i] * (1 - attackRate) + rawBarValue * attackRate;
+    } else {
+      // Release - fall slowly
+      smoothedBars[i] = smoothedBars[i] * (1 - releaseRate) + rawBarValue * releaseRate;
+    }
+    
+    // Update peak values for visual reference
+    if (smoothedBars[i] > peakValues[i]) {
+      peakValues[i] = smoothedBars[i];
+    } else {
+      peakValues[i] = peakValues[i] * decayRate;
+    }
+    
+    // Convert to bar height (0-7)
+    barHeights[i] = constrain((int)(smoothedBars[i] * 8), 0, 7);
+  }
+  
+  // Debug output
+  static unsigned long lastDebugTime = 0;
+  if (millis() - lastDebugTime > 500) {
+    lastDebugTime = millis();
+    Serial.print("Freq: ");
+    Serial.print(smoothedFrequency);
+    Serial.print(" Hz, Amp: ");
+    Serial.print(normalizedAmplitude);
+    Serial.print(", Bars: ");
+    for (int i = 0; i < 8; i++) {
+      Serial.print(barHeights[i]);
+      Serial.print(" ");
+    }
+    Serial.println();
+  }
+}
+
+void displayBars() {
+  lcd.clear();
+  
+  // Display title on first line
+  lcd.setCursor(0, 0);
+  lcd.print("Audio EQ");
+  
+  // Display frequency range indication
+  lcd.setCursor(9, 0);
+  if (smoothedFrequency < 100) {
+    lcd.print("Bass");
+  } else if (smoothedFrequency < 500) {
+    lcd.print("Low");
+  } else if (smoothedFrequency < 2000) {
+    lcd.print("Mid");
+  } else {
+    lcd.print("High");
+  }
+  
+  // Optional: Show frequency value
+  lcd.setCursor(13, 0);
+  int freqDisplay = (int)smoothedFrequency;
+  if (freqDisplay > 999) freqDisplay = 999;
+  if (freqDisplay < 0) freqDisplay = 0;
+  if (freqDisplay < 10) lcd.print(" ");
+  if (freqDisplay < 100) lcd.print(" ");
+  lcd.print(freqDisplay);
+  
+  // Display all 8 bars on the second line
+  lcd.setCursor(0, 1);
+  
+  for (int i = 0; i < 8; i++) {
+    lcd.write((uint8_t)barHeights[i]);
+    // Add space between bars (except after last bar)
+    if (i < 7) {
+      lcd.write(' ');
+    }
+  }
+  
+  // Show peak indicator (optional - display a dot for peaks)
+  lcd.setCursor(15, 1);
+  float avgPeak = 0;
+  for (int i = 0; i < 8; i++) {
+    avgPeak += peakValues[i];
+  }
+  avgPeak /= 8;
+  if (avgPeak > 0.8) {
+    lcd.write('*');
+  } else if (avgPeak > 0.5) {
+    lcd.write('.');
+  } else {
+    lcd.write(' ');
+  }
+}
+
+// Alternative: SIMPLE REAL-TIME VU METER (all bars move together)
+// Uncomment this function and comment the one above if you prefer this mode
+/*
+void displayBars() {
+  lcd.clear();
+  
+  lcd.setCursor(0, 0);
+  lcd.print("Sound Level");
+  
+  // Use the highest amplitude bar for VU meter
+  float maxLevel = 0;
+  for (int i = 0; i < 8; i++) {
+    if (smoothedBars[i] > maxLevel) maxLevel = smoothedBars[i];
+  }
+  
+  int vuHeight = constrain((int)(maxLevel * 8), 0, 7);
+  
+  lcd.setCursor(0, 1);
+  for (int i = 0; i < 8; i++) {
+    if (i <= vuHeight) {
+      lcd.write((uint8_t)7); // Full bar
+    } else {
+      lcd.write((uint8_t)0); // Empty
+    }
+    if (i < 7) lcd.write(' ');
+  }
+  
+  // Show percentage
+  lcd.setCursor(12, 1);
+  int percent = (vuHeight * 100) / 7;
+  if (percent < 10) lcd.print(" ");
+  if (percent < 100) lcd.print(" ");
+  lcd.print(percent);
+  lcd.print("%");
+}
+*/
